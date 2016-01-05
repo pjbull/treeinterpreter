@@ -113,6 +113,56 @@ def _predict_tree(model, X):
     return direct_prediction, biases, contributions
 
 
+def _predict_tree_parallel(X, tree_, leaves, model_type, n_classes_):
+    """
+    For a given DecisionTreeRegressor or DecisionTreeClassifier,
+    returns a triple of [prediction, bias and feature_contributions], such
+    that prediction ≈ bias + feature_contributions.
+    """
+    #leaves = model.apply(X)
+    paths = _get_tree_paths(tree_, 0)
+
+    for path in paths:
+        path.reverse()
+
+    # remove the single-dimensional inner arrays
+    values = tree_.value.squeeze()
+    # reshape if squeezed into a single float
+    if len(values.shape) == 0:
+        values = np.array([values])
+
+    if model_type == DecisionTreeRegressor:
+        contributions = np.zeros(X.shape)
+        biases = np.zeros(X.shape[0])
+        line_shape = X.shape[1]
+    elif model_type == DecisionTreeClassifier:
+        # scikit stores category counts, we turn them into probabilities
+        normalizer = values.sum(axis=1)[:, np.newaxis]
+        normalizer[normalizer == 0.0] = 1.0
+        values /= normalizer
+
+        biases = np.zeros((X.shape[0], n_classes_))
+        contributions = np.zeros((X.shape[0],
+                                  X.shape[1], n_classes_))
+        line_shape = (X.shape[1], n_classes_)
+
+    for row, leaf in enumerate(leaves):
+        for path in paths:
+            if leaf == path[-1]:
+                break
+        biases[row] = values[path[0]]
+        contribs = np.zeros(line_shape)
+        for i in range(len(path) - 1):
+            contrib = values[path[i+1]] - \
+                      values[path[i]]
+            contribs[tree_.feature[path[i]]] += contrib
+        contributions[row] = contribs
+
+    direct_prediction = values[leaves]
+
+    return direct_prediction, biases, contributions
+
+
 def _predict_forest(model, X, n_jobs, verbose, batch_size):
     """
     For a given RandomForestRegressor or RandomForestClassifier,
@@ -130,7 +180,8 @@ def _predict_forest(model, X, n_jobs, verbose, batch_size):
             contributions.append(contribution)
             predictions.append(pred)
     else:
-        tasks = [delayed(_predict_tree)(tree, X) for tree in model.estimators_]
+        tasks = [delayed(_predict_tree_parallel)(X, tree.tree_, tree.apply(X), type(tree), tree.n_classes_)
+                    for tree in model.estimators_]
         results = Parallel(n_jobs=n_jobs, verbose=verbose, batch_size=batch_size)(tasks)
         predictions, biases, contributions = zip(*results)
 
