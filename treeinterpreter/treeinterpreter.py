@@ -1,13 +1,24 @@
 # -*- coding: utf-8 -*-
-from joblib import Parallel, delayed
 import numpy as np
 from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier, _tree
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.ensemble import RandomForestClassifier
 from distutils.version import LooseVersion
 import sklearn
+
 if LooseVersion(sklearn.__version__) < LooseVersion("0.17"):
     raise Exception("treeinterpreter requires scikit-learn 0.17 or later")
+
+try:
+    import joblib
+    from joblib import Parallel, delayed
+
+    if LooseVersion(joblib.__version__) < LooseVersion("0.9.3"):
+        raise Exception("treeinterpreter requires joblib 0.9.3 or later")
+
+    SUPPORTS_PARALLEL = True
+except ImportError:
+    SUPPORTS_PARALLEL = False
 
 
 def _get_tree_paths(tree, node_id, depth=0):
@@ -52,8 +63,7 @@ def _process_leaf(feature_mat, row, leaf, paths, values, line_shape):
     contribution = contribs
     return row, bias, contribution
 
-
-def _predict_tree(model, X, n_jobs, verbose):
+def _predict_tree(model, X):
     """
     For a given DecisionTreeRegressor or DecisionTreeClassifier,
     returns a triple of [prediction, bias and feature_contributions], such
@@ -86,28 +96,24 @@ def _predict_tree(model, X, n_jobs, verbose):
                                   X.shape[1], model.n_classes_))
         line_shape = (X.shape[1], model.n_classes_)
 
-    if n_jobs == 1:
-        for row, leaf in enumerate(leaves):
-            _, bias, contribution = _process_leaf(model.tree_.feature, row, leaf, paths, values, line_shape)
-            contributions[row] = contribution
-            biases[row] = bias
-    else:
-        feature_mat = model.tree_.feature
-        jobs = [delayed(_process_leaf)(feature_mat, row, leaf, paths, values, line_shape)
-                    for row, leaf in enumerate(leaves)]
-        results = Parallel(n_jobs=n_jobs, verbose=verbose)(jobs)
-
-        # storing the results in a loop should be cheap
-        for row, bias, contribution in results:
-            contributions[row] = contribution
-            biases[row] = bias
+    for row, leaf in enumerate(leaves):
+        for path in paths:
+            if leaf == path[-1]:
+                break
+        biases[row] = values[path[0]]
+        contribs = np.zeros(line_shape)
+        for i in range(len(path) - 1):
+            contrib = values[path[i+1]] - \
+                      values[path[i]]
+            contribs[model.tree_.feature[path[i]]] += contrib
+        contributions[row] = contribs
 
     direct_prediction = values[leaves]
 
     return direct_prediction, biases, contributions
 
 
-def _predict_forest(model, X, n_jobs, verbose):
+def _predict_forest(model, X, n_jobs, verbose, batch_size):
     """
     For a given RandomForestRegressor or RandomForestClassifier,
     returns a triple of [prediction, bias and feature_contributions], such
@@ -116,16 +122,23 @@ def _predict_forest(model, X, n_jobs, verbose):
     biases = []
     contributions = []
     predictions = []
-    for tree in model.estimators_:
-        pred, bias, contribution = _predict_tree(tree, X, n_jobs=n_jobs, verbose=verbose)
-        biases.append(bias)
-        contributions.append(contribution)
-        predictions.append(pred)
+
+    if n_jobs == 1:
+        for tree in model.estimators_:
+            pred, bias, contribution = _predict_tree(tree, X)
+            biases.append(bias)
+            contributions.append(contribution)
+            predictions.append(pred)
+    else:
+        tasks = [delayed(_predict_tree)(tree, X) for tree in model.estimators_]
+        results = Parallel(n_jobs=n_jobs, verbose=verbose, batch_size=batch_size)(tasks)
+        predictions, biases, contributions = zip(*results)
+
     return (np.mean(predictions, axis=0), np.mean(biases, axis=0),
             np.mean(contributions, axis=0))
 
 
-def predict(model, X, n_jobs=1, verbose=0):
+def predict(model, X, n_jobs=1, verbose=0, batch_size='auto'):
     """ Returns a triple (prediction, bias, feature_contributions), such
     that prediction ≈ bias + feature_contributions.
     Parameters
@@ -138,10 +151,14 @@ def predict(model, X, n_jobs=1, verbose=0):
     Test samples.
 
     n_jobs [optional]: Use joblib to parallelize the computation with n_jobs
-        processes; default is 1 job (serial)
+        processes; default is 1 job (serial). Note: only forests will be
+        run in parallel.
 
     verbose [optional]: Print debug information from joblib by increasing
         this setting; default is 0.
+
+    batch_size [optional]: The number of trees to pass at a time to joblib; the
+        default ('auto') should work well in most cases.
 
     Returns
     -------
@@ -157,12 +174,15 @@ def predict(model, X, n_jobs=1, verbose=0):
     if model.n_outputs_ > 1:
         raise ValueError("Multilabel classification trees not supported")
 
+    if n_jobs > 1 and not SUPPORTS_PARALLEL:
+        raise ValueError("If joblib is not installed, treeinterpreter only supports n_jobs=1")
+
     if (type(model) == DecisionTreeRegressor or
         type(model) == DecisionTreeClassifier):
-        return _predict_tree(model, X, n_jobs=n_jobs, verbose=verbose)
+        return _predict_tree(model, X)
     elif (type(model) == RandomForestRegressor or
           type(model) == RandomForestClassifier):
-        return _predict_forest(model, X, n_jobs=n_jobs, verbose=verbose)
+        return _predict_forest(model, X, n_jobs=n_jobs, verbose=verbose, batch_size=batch_size)
     else:
         raise ValueError("Wrong model type. Base learner needs to be \
             DecisionTreeClassifier or DecisionTreeRegressor.")
@@ -175,11 +195,11 @@ if __name__ == "__main__":
     np.random.shuffle(idx)
     X = iris.data[idx]
     Y = iris.target[idx]
-    dt = RandomForestClassifier(max_depth=3)
+    dt = RandomForestClassifier(max_depth=20, n_estimators=1500)
     dt.fit(X[:len(X)/2], Y[:len(X)/2])
     testX = X[len(X)/2:len(X)/2+5]
     base_prediction = dt.predict_proba(testX)
-    pred, bias, contrib = _predict_forest(dt, testX)
+    pred, bias, contrib = predict(dt, testX, n_jobs=2, verbose=10)
 
     assert(np.allclose(base_prediction, pred))
     assert(np.allclose(pred, bias + np.sum(contrib, axis=1)))
