@@ -75,15 +75,16 @@ class TestTreeinterpreter(unittest.TestCase):
         self.assertTrue(np.allclose(base_prediction, pred))
         self.assertTrue(np.allclose(pred, bias + np.sum(contrib, axis=1)))
 
-    def test_tree_classifier_parallel(self):
-        X = self.iris.data
-        Y = self.iris.target
-        dt = DecisionTreeClassifier()
+    def test_forest_classifier_parallel(self):
+        idx = range(len(self.iris.data))
+        np.random.shuffle(idx)
+        X = self.iris.data[idx]
+        Y = self.iris.target[idx]
+        dt = RandomForestClassifier(max_depth=20, n_estimators=500)
         dt.fit(X[:len(X)/2], Y[:len(X)/2])
-        testX = X[len(X)/2:len(X)/2+1]
+        testX = X[len(X)/2:]
         base_prediction = dt.predict_proba(testX)
         pred, bias, contrib = treeinterpreter.predict(dt, testX, n_jobs=2)
-
         self.assertTrue(np.allclose(base_prediction, pred))
         self.assertTrue(np.allclose(pred, bias + np.sum(contrib, axis=1)))
 
@@ -93,7 +94,7 @@ class TestTreeinterpreter(unittest.TestCase):
         testX = X[len(X)/2:]
 
         #Predict for decision tree
-        dt = RandomForestRegressor(n_estimators=10)
+        dt = RandomForestRegressor(max_depth=20, n_estimators=500)
         dt.fit(X[:len(X)/2], Y[:len(X)/2])
 
         base_prediction = dt.predict(testX)
