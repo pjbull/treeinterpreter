@@ -113,20 +113,17 @@ def _predict_tree(model, X):
     return direct_prediction, biases, contributions
 
 
-def _predict_tree_parallel(X, tree_, leaves, model_type, n_classes_):
+def _predict_tree_parallel(X, paths, tree_vals, leaves, model_type, n_classes_, tree_features):
     """
     For a given DecisionTreeRegressor or DecisionTreeClassifier,
     returns a triple of [prediction, bias and feature_contributions], such
     that prediction ≈ bias + feature_contributions.
     """
-    #leaves = model.apply(X)
-    paths = _get_tree_paths(tree_, 0)
-
     for path in paths:
         path.reverse()
 
     # remove the single-dimensional inner arrays
-    values = tree_.value.squeeze()
+    values = tree_vals.squeeze()
     # reshape if squeezed into a single float
     if len(values.shape) == 0:
         values = np.array([values])
@@ -155,7 +152,7 @@ def _predict_tree_parallel(X, tree_, leaves, model_type, n_classes_):
         for i in range(len(path) - 1):
             contrib = values[path[i+1]] - \
                       values[path[i]]
-            contribs[tree_.feature[path[i]]] += contrib
+            contribs[tree_features[path[i]]] += contrib
         contributions[row] = contribs
 
     direct_prediction = values[leaves]
@@ -180,7 +177,13 @@ def _predict_forest(model, X, n_jobs, verbose, batch_size):
             contributions.append(contribution)
             predictions.append(pred)
     else:
-        tasks = [delayed(_predict_tree_parallel)(X, tree.tree_, tree.apply(X), type(tree), tree.n_classes_)
+        tasks = [delayed(_predict_tree_parallel)(X,
+                                                 _get_tree_paths(tree.tree_, 0),
+                                                 tree.tree_.value,
+                                                 tree.apply(X),
+                                                 type(tree),
+                                                 tree.n_classes_,
+                                                 tree.tree_.feature)
                     for tree in model.estimators_]
         results = Parallel(n_jobs=n_jobs, verbose=verbose, batch_size=batch_size)(tasks)
         predictions, biases, contributions = zip(*results)
